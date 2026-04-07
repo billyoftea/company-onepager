@@ -1,8 +1,27 @@
 import json
+import re
 import sys
 
 
-def fmt_num(value, usd=False):
+CURRENCY_PREFIX = {
+    'USD': '$',
+    'HKD': 'HK$',
+    'CNY': '¥',
+}
+
+BUSINESS_KEYWORDS = [
+    '业务', '产品', '服务', '平台', '销售', '生产', '提供', '处理器', '芯片', '游戏', '广告', '社交',
+    '云', '金融科技', '互联网', '软件', '硬件', '白酒', '数据中心', '汽车', '通信', '计算', '娱乐',
+]
+
+
+def clean_text(text):
+    text = (text or '').replace('\u3000', ' ')
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def fmt_num(value, currency=None):
     if value in (None, '', False):
         return 'NA'
     if isinstance(value, str):
@@ -10,13 +29,13 @@ def fmt_num(value, usd=False):
     number = float(value)
     sign = '-' if number < 0 else ''
     number = abs(number)
-    prefix = '$' if usd else ''
+    prefix = CURRENCY_PREFIX.get(currency, '')
     if number >= 1e12:
         return f'{sign}{prefix}{number/1e12:.2f}T'
     if number >= 1e9:
         return f'{sign}{prefix}{number/1e9:.2f}B'
-    if number >= 1e8 and not usd:
-        return f'{sign}{number/1e8:.2f}亿'
+    if number >= 1e8 and currency == 'CNY':
+        return f'{sign}{prefix}{number/1e8:.2f}亿'
     if number >= 1e6:
         return f'{sign}{prefix}{number/1e6:.2f}M'
     return f'{sign}{prefix}{number:.2f}'
@@ -28,10 +47,30 @@ def safe_float(value):
     if isinstance(value, (int, float)):
         return float(value)
     text = str(value).replace(',', '').replace('%', '').strip()
+    text = text.replace('HK$', '').replace('$', '').replace('¥', '')
+    for unit, multiple in [('万亿', 1e12), ('亿', 1e8), ('万', 1e4)]:
+        if text.endswith(unit):
+            try:
+                return float(text[:-len(unit)]) * multiple
+            except Exception:
+                return None
     try:
         return float(text)
     except Exception:
         return None
+
+
+def pct_text(value, digits=1):
+    if value in (None, '', False):
+        return 'NA'
+    if isinstance(value, str) and value.strip().endswith('%'):
+        return value.strip()
+    number = safe_float(value)
+    if number is None:
+        return 'NA'
+    if abs(number) <= 1:
+        number *= 100
+    return f'{number:.{digits}f}%'
 
 
 def ratio(a, b):
@@ -42,10 +81,13 @@ def ratio(a, b):
     return a / b
 
 
-def pct_text(value, digits=1):
+def as_ratio(value):
+    value = safe_float(value)
     if value is None:
-        return 'NA'
-    return f'{value * 100:.{digits}f}%'
+        return None
+    if abs(value) > 1:
+        return value / 100
+    return value
 
 
 def bullet_lines(items, fallback, limit=4):
@@ -64,348 +106,362 @@ def render_company_block(data, market_label, code_label):
 - 财报口径: {report_period}"""
 
 
-def first_available(*values):
-    for value in values:
-        if value not in (None, '', False):
-            return value
-    return None
+def split_sentences(text):
+    text = clean_text(text)
+    if not text:
+        return []
+    sentences = re.split(r'[。！？；;]', text)
+    out = []
+    for sentence in sentences:
+        sentence = clean_text(sentence).strip(' ,，。；;')
+        if len(sentence) >= 6:
+            out.append(sentence)
+    return out
 
 
-def top_segments_text(segments):
-    parts = []
-    for seg in segments[:3]:
-        name = seg.get('segment')
-        share = seg.get('ratio')
-        if not name:
+def pick_intro_sentences(text, limit=2):
+    sentences = split_sentences(text)
+    if not sentences:
+        return []
+    scored = []
+    for idx, sentence in enumerate(sentences):
+        score = 0
+        for keyword in BUSINESS_KEYWORDS:
+            if keyword in sentence:
+                score += 1
+        if idx == 0:
+            score += 0.2
+        scored.append((score, idx, sentence))
+    ranked = sorted(scored, key=lambda item: (-item[0], item[1]))
+    selected_idx = sorted([idx for _, idx, _ in ranked[:limit]])
+    return [sentences[idx] for idx in selected_idx][:limit]
+
+
+def unique_points(points):
+    seen = []
+    out = []
+    for point in points:
+        key = re.sub(r'\W+', '', clean_text(point))
+        key = re.sub(r'^(公司主营|公司的主营业务是|集团的主要业务包括|主营业务是)', '', key)
+        if not key:
             continue
-        if share is not None:
-            parts.append(f"{name}({share * 100:.1f}%)")
-        else:
-            parts.append(name)
-    return '、'.join(parts)
+        if any(key in old or old in key for old in seen):
+            continue
+        seen.append(key)
+        out.append(point)
+    return out
 
 
-def price_position_text(price, low, high):
-    price = safe_float(price)
-    low = safe_float(low)
-    high = safe_float(high)
-    if None in (price, low, high) or high <= low:
+def normalized_main_business(text):
+    text = clean_text(text).strip('。')
+    if not text:
         return None
-    pos = (price - low) / (high - low)
-    return pct_text(pos)
+    if text.startswith(('公司主营', '集团的主要业务', '公司的主营业务', '主要业务包括')):
+        return text + '。'
+    return f'公司主营{text}。'
 
 
-def summarize_cn_conclusion(company, growth, roe, debt_ratio):
-    tags = []
-    if growth is not None:
-        if growth >= 0.1:
-            tags.append('增长较快')
-        elif growth > 0:
-            tags.append('仍在增长')
-        else:
-            tags.append('增长承压')
-    if roe is not None:
-        if roe >= 15:
-            tags.append('回报率高')
-        elif roe >= 8:
-            tags.append('回报率尚可')
-    if debt_ratio is not None:
-        if debt_ratio < 30:
-            tags.append('杠杆低')
-        elif debt_ratio > 70:
-            tags.append('杠杆偏高')
-    if not tags:
-        return f'{company} 目前已可自动生成 one-pager，适合做首轮研究。'
-    return f"{company} 当前呈现出{'、'.join(tags)}的特征，适合先列入研究清单，再结合公告做深挖。"
+def business_points(profile, segments=None, market='CN'):
+    profile = profile or {}
+    points = []
+
+    main_business = normalized_main_business(profile.get('mainBusiness'))
+    if main_business:
+        points.append(main_business)
+
+    intro_sentences = pick_intro_sentences(profile.get('businessIntro'), limit=2)
+    for sentence in intro_sentences:
+        if not sentence.endswith('。'):
+            sentence = sentence + '。'
+        points.append(sentence)
+
+    industry = clean_text(profile.get('industry'))
+    if industry:
+        points.append(f'公司所属行业为 {industry}。')
+
+    segments = segments or []
+    if segments:
+        segment_bits = []
+        for seg in segments[:3]:
+            name = clean_text(seg.get('segment'))
+            share = seg.get('ratio')
+            if not name:
+                continue
+            if share is not None:
+                segment_bits.append(f'{name}({share * 100:.1f}%)')
+            else:
+                segment_bits.append(name)
+        if segment_bits:
+            points.append(f"收入结构以 {'、'.join(segment_bits)} 为主。")
+        top_share = segments[0].get('ratio') if segments and segments[0].get('ratio') is not None else None
+        if top_share is not None and top_share >= 0.7:
+            points.append(f'核心业务收入占比约 {top_share * 100:.1f}%，主业集中度较高。')
+
+    return unique_points(points)
 
 
-def summarize_hk_conclusion(company, margin, leverage, ocf_margin):
-    tags = []
-    if margin is not None:
-        if margin >= 0.2:
-            tags.append('盈利能力强')
-        elif margin >= 0.1:
-            tags.append('盈利能力尚可')
-        else:
-            tags.append('利润率偏薄')
-    if leverage is not None:
-        if leverage < 0.5:
-            tags.append('杠杆可控')
-        elif leverage > 0.7:
-            tags.append('杠杆偏高')
-    if ocf_margin is not None and ocf_margin > 0.2:
-        tags.append('现金流质量不错')
-    if not tags:
-        return f'{company} 已可自动生成港股 one-pager，适合做基本面快速筛选。'
-    return f"{company} 当前整体呈现{'、'.join(tags)}的画像，比较适合做首轮投研判断。"
-
-
-def summarize_us_conclusion(company, margin, leverage, approx_pe, price_pos):
-    tags = []
-    if margin is not None:
-        if margin >= 0.2:
-            tags.append('高盈利')
-        elif margin < 0.1:
-            tags.append('盈利偏薄')
-    if leverage is not None:
-        if leverage < 0.5:
-            tags.append('低杠杆')
-        elif leverage > 0.7:
-            tags.append('高杠杆')
-    if approx_pe is not None:
-        if approx_pe >= 30:
-            tags.append('估值不低')
-        elif approx_pe <= 15:
-            tags.append('估值压力不大')
-    if price_pos is not None and price_pos >= 0.8:
-        tags.append('股价接近区间高位')
-    if not tags:
-        return f'{company} 已可自动拉取 SEC 财务和行情生成 one-pager，适合做首轮研究。'
-    return f"{company} 当前更像一只{'、'.join(tags)}的标的，适合在基本面判断后再结合估值与预期做取舍。"
-
-
-def render_cn(data):
+def normalize_cn(data):
     f = data.get('financials', {})
-    market = data.get('market', {})
-    segments = data.get('businessSegments') or []
-
-    revenue_growth = safe_float(f.get('营业总收入同比增长率'))
-    profit_growth = safe_float(first_available(f.get('净利润同比增长率'), f.get('扣非净利润同比增长率')))
-    gross_margin = safe_float(f.get('销售毛利率'))
-    net_margin = safe_float(f.get('销售净利率'))
-    roe = safe_float(f.get('净资产收益率'))
-    debt_ratio = safe_float(f.get('资产负债率'))
-    ocf_per_share = safe_float(f.get('每股经营现金流'))
-    top_share = segments[0].get('ratio') if segments else None
-    segment_text = top_segments_text(segments)
-
-    business = []
-    if segment_text:
-        business.append(f'主营收入主要由 {segment_text} 驱动，能较快看出公司靠什么赚钱。')
-    business.append('A 股版 one-pager 更强调增长、盈利、回报率和资产负债表的组合质量。')
-    if top_share is not None and top_share >= 0.7:
-        business.append(f'头部业务收入占比约 {top_share * 100:.1f}%，主业集中度较高。')
-
-    highlights = []
-    if gross_margin is not None and gross_margin >= 50:
-        highlights.append(f'销售毛利率约 {gross_margin:.2f}%，通常意味着产品、品牌或渠道具备较强议价能力。')
-    if roe is not None and roe >= 15:
-        highlights.append(f'净资产收益率约 {roe:.2f}%，资本回报表现亮眼。')
-    if revenue_growth is not None and revenue_growth > 0:
-        highlights.append(f'营业总收入同比增长 {revenue_growth:.2f}%，收入端仍在扩张。')
-    if net_margin is not None and net_margin >= 20:
-        highlights.append(f'销售净利率约 {net_margin:.2f}%，利润转化能力较强。')
-    if ocf_per_share is not None and ocf_per_share > 0:
-        highlights.append(f'每股经营现金流为 {ocf_per_share:.2f}，主营业务具备现金回流能力。')
-
-    risks = []
-    if debt_ratio is not None and debt_ratio >= 60:
-        risks.append(f'资产负债率约 {debt_ratio:.2f}%，杠杆偏高，需要继续盯债务和偿付结构。')
-    if revenue_growth is not None and revenue_growth < 0:
-        risks.append(f'营业总收入同比增长 {revenue_growth:.2f}%，增长动能偏弱。')
-    if profit_growth is not None and profit_growth < 0:
-        risks.append(f'净利润同比增长 {profit_growth:.2f}%，利润端有压力。')
-    if top_share is not None and top_share >= 0.7:
-        risks.append('业务集中度较高，单一核心品类或单一主线景气度波动会放大业绩波动。')
-    if data.get('warnings'):
-        risks.append('部分字段抓取受公开接口稳定性影响，重要结论前应与公司公告交叉核验。')
-    if not risks:
-        risks.append('公开聚合源和正式公告之间可能存在细微口径差，正式下结论前仍建议复核。')
-
-    conclusion = summarize_cn_conclusion(data.get('company'), None if revenue_growth is None else revenue_growth / 100, roe, debt_ratio)
-
-    return f"""{render_company_block(data, 'A股', '代码')}
-
-## 业务
-{bullet_lines(business, '业务描述待补充。')}
-
-## 财务摘要
-- 营业总收入: {f.get('营业总收入', 'NA')}
-- 营业总收入同比: {f.get('营业总收入同比增长率', 'NA')}
-- 净利润: {f.get('净利润', 'NA')}
-- 净利润同比: {first_available(f.get('净利润同比增长率'), f.get('扣非净利润同比增长率'), 'NA')}
-- 销售毛利率: {f.get('销售毛利率', 'NA')}
-- 销售净利率: {f.get('销售净利率', 'NA')}
-- 净资产收益率: {f.get('净资产收益率', 'NA')}
-- 资产负债率: {f.get('资产负债率', 'NA')}
-- 每股经营现金流: {f.get('每股经营现金流', 'NA')}
-- 最新价: {market.get('price', 'NA')}
-- 开盘/昨收: {market.get('open', 'NA')} / {market.get('prev_close', 'NA')}
-- 日内区间: {market.get('low', 'NA')} - {market.get('high', 'NA')}
-
-## 亮点
-{bullet_lines(highlights, 'A 股财务与行情数据链路已接通，可以直接做第一轮筛选。')}
-
-## 风险
-{bullet_lines(risks, '需结合公司公告继续核验。')}
-
-## 一句话结论
-- {conclusion}"""
+    ms = data.get('marketStats', {})
+    revenue = safe_float(f.get('营业总收入'))
+    net_income = safe_float(f.get('净利润'))
+    gross_margin = as_ratio(f.get('销售毛利率'))
+    net_margin = as_ratio(f.get('销售净利率'))
+    leverage = as_ratio(f.get('资产负债率'))
+    revenue_growth = as_ratio(f.get('营业总收入同比增长率'))
+    net_income_growth = as_ratio(f.get('净利润同比增长率'))
+    if net_income_growth is None:
+        net_income_growth = as_ratio(f.get('扣非净利润同比增长率'))
+    market_cap = safe_float(ms.get('marketCap'))
+    ps = market_cap / revenue if market_cap and revenue else None
+    return {
+        'marketLabel': 'A股',
+        'codeLabel': '代码',
+        'currency': 'CNY',
+        'profile': data.get('profile', {}),
+        'segments': data.get('businessSegments') or [],
+        'revenue': f.get('营业总收入', 'NA'),
+        'revenueGrowth': revenue_growth,
+        'grossMargin': gross_margin,
+        'netIncome': f.get('净利润', 'NA'),
+        'netIncomeGrowth': net_income_growth,
+        'netMargin': net_margin,
+        'operatingCashFlow': None,
+        'operatingCashFlowMargin': None,
+        'operatingCashFlowPerShare': f.get('每股经营现金流'),
+        'leverage': leverage,
+        'cashToLiabilities': None,
+        'marketCap': market_cap,
+        'pe': safe_float(ms.get('pe')),
+        'pb': safe_float(ms.get('pb')),
+        'ps': ps,
+        'warnings': data.get('warnings') or [],
+    }
 
 
-def render_hk(data):
+def normalize_hk(data):
     f = data.get('financials', {})
-    market = data.get('market', {})
-    margin = ratio(f.get('netIncome'), f.get('revenue'))
-    leverage = ratio(f.get('liabilities'), f.get('assets'))
-    ocf_margin = ratio(f.get('operatingCashFlow'), f.get('revenue'))
-
-    business = [
-        '港股版 one-pager 更适合先看盈利能力、杠杆水平和现金流，再结合股价反馈判断市场预期。',
-    ]
-    if margin is not None and leverage is not None:
-        business.append(f'从财务画像看，当前净利率约 {margin * 100:.1f}%，负债占总资产比例约 {leverage * 100:.1f}%。')
-    if ocf_margin is not None:
-        business.append(f'经营现金流收入比约 {ocf_margin * 100:.1f}%，能帮助判断利润的含金量。')
-
-    highlights = []
-    if margin is not None and margin >= 0.2:
-        highlights.append(f'净利率约 {margin * 100:.1f}%，盈利质量偏强。')
-    if leverage is not None and leverage < 0.6:
-        highlights.append(f'负债占总资产比例约 {leverage * 100:.1f}%，资产负债表压力不大。')
-    if ocf_margin is not None and ocf_margin > 0.2:
-        highlights.append(f'经营现金流收入比约 {ocf_margin * 100:.1f}%，现金流表现不错。')
-    if safe_float(market.get('change_pct')) is not None:
-        highlights.append(f"最新行情涨跌幅 {market.get('change_pct')}%，可以把市场反馈和财务画像放在一起看。")
-
-    risks = []
-    if leverage is not None and leverage >= 0.7:
-        risks.append(f'负债占总资产比例约 {leverage * 100:.1f}%，杠杆偏高，需要关注再融资和偿债能力。')
-    if margin is not None and margin < 0.1:
-        risks.append(f'净利率约 {margin * 100:.1f}%，利润安全垫偏薄。')
-    if ocf_margin is not None and ocf_margin < 0.1:
-        risks.append(f'经营现金流收入比约 {ocf_margin * 100:.1f}%，利润兑现成现金的能力偏弱。')
-    if data.get('warnings'):
-        risks.append('公开网页行情和聚合财报字段偶尔会抖，关键字段最好二次校验。')
-    if not risks:
-        risks.append('港股字段映射仍需结合原始财报科目名做交叉确认。')
-
-    conclusion = summarize_hk_conclusion(data.get('company'), margin, leverage, ocf_margin)
-
-    return f"""{render_company_block(data, '港股', '代码')}
-
-## 业务
-{bullet_lines(business, '业务描述待补充。')}
-
-## 财务摘要
-- 收入: {fmt_num(f.get('revenue'))}
-- 毛利: {fmt_num(f.get('grossProfit'))}
-- 净利润: {fmt_num(f.get('netIncome'))}
-- 净利率: {pct_text(margin)}
-- 总资产: {fmt_num(f.get('assets'))}
-- 总负债: {fmt_num(f.get('liabilities'))}
-- 负债/资产: {pct_text(leverage)}
-- 现金: {fmt_num(f.get('cash'))}
-- 经营现金流: {fmt_num(f.get('operatingCashFlow'))}
-- 经营现金流/收入: {pct_text(ocf_margin)}
-- 最新价: {market.get('price', 'NA')}
-- 开盘/昨收: {market.get('open', 'NA')} / {market.get('prev_close', 'NA')}
-- 日内区间: {market.get('low', 'NA')} - {market.get('high', 'NA')}
-- 涨跌幅: {market.get('change_pct', 'NA')}
-
-## 亮点
-{bullet_lines(highlights, '港股财报与行情抓取已接通，可以先做首轮研究。')}
-
-## 风险
-{bullet_lines(risks, '需结合公告继续做交叉核验。')}
-
-## 一句话结论
-- {conclusion}"""
-
-
-def render_us(data):
-    f = data.get('financials', {})
-    market = data.get('market', {})
-    profile = data.get('profile', {})
-
-    margin = ratio(f.get('netIncome'), f.get('revenue'))
-    leverage = ratio(f.get('liabilities'), f.get('assets'))
-    ocf_margin = ratio(f.get('operatingCashFlow'), f.get('revenue'))
-    cash_ratio = ratio(f.get('cash'), f.get('liabilities'))
-    fcf = None
-    if safe_float(f.get('operatingCashFlow')) is not None and safe_float(f.get('capex')) is not None:
-        fcf = safe_float(f.get('operatingCashFlow')) - safe_float(f.get('capex'))
-
-    market_cap = safe_float(market.get('market_cap'))
+    ms = data.get('marketStats', {})
+    revenue = safe_float(f.get('revenue'))
+    gross_profit = safe_float(f.get('grossProfit'))
     net_income = safe_float(f.get('netIncome'))
-    approx_pe = None
-    if market_cap and net_income and net_income > 0:
-        approx_pe = market_cap / net_income
-    price_pos = None
-    price_val = safe_float(market.get('price'))
-    low_52 = safe_float(market.get('year_low'))
-    high_52 = safe_float(market.get('year_high'))
-    if None not in (price_val, low_52, high_52) and high_52 > low_52:
-        price_pos = (price_val - low_52) / (high_52 - low_52)
+    liabilities = safe_float(f.get('liabilities'))
+    assets = safe_float(f.get('assets'))
+    cash = safe_float(f.get('cash'))
+    operating_cf = safe_float(f.get('operatingCashFlow'))
+    market_cap = safe_float(ms.get('marketCap'))
+    return {
+        'marketLabel': '港股',
+        'codeLabel': '代码',
+        'currency': 'HKD',
+        'profile': data.get('profile', {}),
+        'segments': [],
+        'revenue': fmt_num(revenue, 'HKD'),
+        'revenueGrowth': f.get('revenueGrowth'),
+        'grossMargin': ratio(gross_profit, revenue),
+        'netIncome': fmt_num(net_income, 'HKD'),
+        'netIncomeGrowth': f.get('netIncomeGrowth'),
+        'netMargin': ratio(net_income, revenue),
+        'operatingCashFlow': fmt_num(operating_cf, 'HKD'),
+        'operatingCashFlowMargin': ratio(operating_cf, revenue),
+        'operatingCashFlowPerShare': None,
+        'leverage': ratio(liabilities, assets),
+        'cashToLiabilities': ratio(cash, liabilities),
+        'marketCap': market_cap,
+        'pe': safe_float(ms.get('pe')),
+        'pb': safe_float(ms.get('pb')),
+        'ps': market_cap / revenue if market_cap and revenue else None,
+        'warnings': data.get('warnings') or [],
+    }
 
-    business = []
-    if profile.get('sicDescription'):
-        business.append(f"公司所属行业为 {profile.get('sicDescription')}，可以先把它放进对应产业链框架里理解。")
-    if margin is not None and ocf_margin is not None:
-        business.append(f'从财务侧看，当前净利率约 {margin * 100:.1f}%，经营现金流率约 {ocf_margin * 100:.1f}%。')
-    if profile.get('website'):
-        business.append(f"如需继续深挖产品和客户结构，可进一步抓取官网 {profile.get('website')} 与 IR 页面。")
 
+def normalize_us(data):
+    f = data.get('financials', {})
+    ms = data.get('marketStats', {})
+    revenue = safe_float(f.get('revenue'))
+    gross_profit = safe_float(f.get('grossProfit'))
+    net_income = safe_float(f.get('netIncome'))
+    liabilities = safe_float(f.get('liabilities'))
+    assets = safe_float(f.get('assets'))
+    cash = safe_float(f.get('cash'))
+    operating_cf = safe_float(f.get('operatingCashFlow'))
+    market_cap = safe_float(ms.get('marketCap'))
+    equity = assets - liabilities if assets is not None and liabilities is not None else None
+    pb = safe_float(ms.get('pb'))
+    if pb is None and equity not in (None, 0):
+        pb = market_cap / equity if market_cap else None
+    return {
+        'marketLabel': '美股',
+        'codeLabel': '代码',
+        'currency': 'USD',
+        'profile': data.get('profile', {}),
+        'segments': [],
+        'revenue': fmt_num(revenue, 'USD'),
+        'revenueGrowth': f.get('revenueGrowth'),
+        'grossMargin': ratio(gross_profit, revenue),
+        'netIncome': fmt_num(net_income, 'USD'),
+        'netIncomeGrowth': f.get('netIncomeGrowth'),
+        'netMargin': ratio(net_income, revenue),
+        'operatingCashFlow': fmt_num(operating_cf, 'USD'),
+        'operatingCashFlowMargin': ratio(operating_cf, revenue),
+        'operatingCashFlowPerShare': None,
+        'leverage': ratio(liabilities, assets),
+        'cashToLiabilities': ratio(cash, liabilities),
+        'marketCap': market_cap,
+        'pe': safe_float(ms.get('pe')),
+        'pb': pb,
+        'ps': market_cap / revenue if market_cap and revenue else None,
+        'warnings': data.get('warnings') or [],
+    }
+
+
+def normalize_payload(data):
+    market = data.get('marketType')
+    if market == 'CN':
+        return normalize_cn(data)
+    if market == 'HK':
+        return normalize_hk(data)
+    return normalize_us(data)
+
+
+def profile_text_blob(metrics):
+    profile = metrics.get('profile') or {}
+    return ' '.join([
+        clean_text(profile.get('mainBusiness')),
+        clean_text(profile.get('businessIntro')),
+        clean_text(profile.get('industry')),
+    ])
+
+
+def generate_highlights(metrics):
     highlights = []
-    if margin is not None and margin >= 0.2:
-        highlights.append(f'净利率约 {margin * 100:.1f}%，盈利能力很强。')
-    if leverage is not None and leverage < 0.5:
-        highlights.append(f'负债占总资产比例约 {leverage * 100:.1f}%，资产负债表偏稳健。')
-    if ocf_margin is not None and ocf_margin > 0.2:
-        highlights.append(f'经营现金流率约 {ocf_margin * 100:.1f}%，利润现金化能力不错。')
-    if fcf is not None and fcf > 0:
-        highlights.append(f'粗略自由现金流约 {fmt_num(fcf, usd=True)}，说明业务不只是账面利润好看。')
-    if approx_pe is not None:
-        highlights.append(f'按当前市值粗略估算，市盈率约 {approx_pe:.1f} 倍，可直接纳入估值讨论。')
+    profile_blob = profile_text_blob(metrics)
+    if metrics.get('grossMargin') is not None and metrics['grossMargin'] >= 0.5:
+        highlights.append(f"毛利率约 {pct_text(metrics['grossMargin'])}，盈利模式具备较强护城河。")
+    if metrics.get('netMargin') is not None and metrics['netMargin'] >= 0.2:
+        highlights.append(f"净利率约 {pct_text(metrics['netMargin'])}，盈利能力处于较高水平。")
+    if metrics.get('revenueGrowth') is not None and metrics['revenueGrowth'] > 0:
+        highlights.append(f"收入增速约 {pct_text(metrics['revenueGrowth'])}，业务规模仍在扩张。")
+    if metrics.get('operatingCashFlowMargin') is not None and metrics['operatingCashFlowMargin'] >= 0.2:
+        highlights.append(f"经营现金流率约 {pct_text(metrics['operatingCashFlowMargin'])}，利润兑现成现金的能力较强。")
+    if metrics.get('leverage') is not None and metrics['leverage'] < 0.5:
+        highlights.append(f"负债/资产约 {pct_text(metrics['leverage'])}，资产负债表较为稳健。")
+    if metrics.get('cashToLiabilities') is not None and metrics['cashToLiabilities'] >= 0.3:
+        highlights.append(f"现金/总负债约 {pct_text(metrics['cashToLiabilities'])}，流动性缓冲较足。")
+    if any(keyword in profile_blob for keyword in ['白酒', '茅台', '酒']):
+        highlights.append('品牌力、渠道控制力和高端产品结构共同支撑了较强的盈利能力。')
+    if any(keyword in profile_blob for keyword in ['社交', '游戏', '广告', '云计算', '金融科技', '互联网']):
+        highlights.append('平台流量与多元业务矩阵之间存在较强的交叉变现能力。')
+    if any(keyword in profile_blob for keyword in ['GPU', 'Tegra', '芯片', '处理器', '半导体', '加速计算']):
+        highlights.append('芯片、软件和平台生态的协同，有助于增强客户黏性和产品壁垒。')
+    return unique_points(highlights)
 
+
+def generate_risks(metrics):
     risks = []
-    if leverage is not None and leverage >= 0.7:
-        risks.append(f'负债占总资产比例约 {leverage * 100:.1f}%，资本结构压力偏大。')
-    if margin is not None and margin < 0.1:
-        risks.append(f'净利率约 {margin * 100:.1f}%，盈利安全垫不厚。')
-    if approx_pe is not None and approx_pe >= 30:
-        risks.append(f'粗略市盈率约 {approx_pe:.1f} 倍，说明市场预期已经不低。')
-    if price_pos is not None and price_pos >= 0.8:
-        risks.append(f'股价位于近 52 周区间的 {pct_text(price_pos)} 位置，预期如果降温，回撤可能放大。')
-    if cash_ratio is not None and cash_ratio < 0.2:
-        risks.append(f'现金/负债比约 {cash_ratio * 100:.1f}%，流动性缓冲不算厚。')
-    if data.get('warnings'):
-        risks.extend(data.get('warnings'))
-    if not risks:
-        risks.append('SEC 字段虽然权威，但不同公司披露口径仍可能有概念差异，正式结论前仍应复核。')
+    profile_blob = profile_text_blob(metrics)
+    revenue_growth = metrics.get('revenueGrowth')
+    if revenue_growth is not None and revenue_growth < 0:
+        risks.append(f"收入增速约 {pct_text(revenue_growth)}，增长动能偏弱。")
+    net_income_growth = metrics.get('netIncomeGrowth')
+    if net_income_growth is not None and net_income_growth < 0:
+        risks.append(f"净利润增速约 {pct_text(net_income_growth)}，利润端承压。")
+    if metrics.get('leverage') is not None and metrics['leverage'] >= 0.7:
+        risks.append(f"负债/资产约 {pct_text(metrics['leverage'])}，杠杆偏高。")
+    segments = metrics.get('segments') or []
+    if segments:
+        top_share = segments[0].get('ratio') if segments[0].get('ratio') is not None else None
+        if top_share is not None and top_share >= 0.7:
+            risks.append(f"核心业务收入占比约 {pct_text(top_share)}，主业集中度较高。")
+    if metrics.get('pe') is not None and metrics['pe'] >= 30:
+        risks.append(f"市盈率约 {metrics['pe']:.1f} 倍，市场预期已经较高。")
+    if metrics.get('pb') is not None and metrics['pb'] >= 5:
+        risks.append(f"市净率约 {metrics['pb']:.1f} 倍，估值溢价处于较高水平。")
+    if any(keyword in profile_blob for keyword in ['白酒', '茅台', '酒']):
+        risks.append('高端消费景气、渠道库存和价格体系变化，会直接影响收入与利润弹性。')
+    if any(keyword in profile_blob for keyword in ['社交', '游戏', '广告', '云计算', '金融科技', '互联网']):
+        risks.append('监管环境、广告景气和重点业务竞争强度变化，会影响平台型业务的利润率。')
+    if any(keyword in profile_blob for keyword in ['GPU', 'Tegra', '芯片', '处理器', '半导体', '加速计算']):
+        risks.append('客户资本开支周期、产品迭代节奏和行业景气变化，会放大业绩波动。')
+    for warning in metrics.get('warnings') or []:
+        risks.append(warning)
+    return unique_points(risks)
 
-    conclusion = summarize_us_conclusion(data.get('company'), margin, leverage, approx_pe, price_pos)
 
-    return f"""{render_company_block(data, '美股', '代码')}
+def conclusion_text(company, metrics):
+    company = clean_text(company)
+    tags = []
+    cautions = []
+    if metrics.get('netMargin') is not None:
+        if metrics['netMargin'] >= 0.2:
+            tags.append('高盈利')
+        elif metrics['netMargin'] < 0.1:
+            cautions.append('利润率偏薄')
+    if metrics.get('revenueGrowth') is not None:
+        rg = metrics['revenueGrowth']
+        if rg >= 0.1:
+            tags.append('增长较快')
+        elif rg < 0:
+            cautions.append('增长承压')
+    if metrics.get('leverage') is not None:
+        if metrics['leverage'] < 0.5:
+            tags.append('低杠杆')
+        elif metrics['leverage'] >= 0.7:
+            cautions.append('杠杆偏高')
+    if metrics.get('operatingCashFlowMargin') is not None and metrics['operatingCashFlowMargin'] >= 0.2:
+        tags.append('现金流质量较好')
+    segments = metrics.get('segments') or []
+    if segments:
+        top_share = segments[0].get('ratio') if segments[0].get('ratio') is not None else None
+        if top_share is not None and top_share >= 0.7:
+            cautions.append('主业集中度高')
+    if metrics.get('pe') is not None and metrics['pe'] >= 30:
+        cautions.append('估值偏高')
+    if not tags and not cautions:
+        return f'{company}的基本面和估值画像整体中性。'
+    if tags and cautions:
+        return f"{company}呈现出{'、'.join(tags)}的特征，但同时存在{'、'.join(cautions)}的约束。"
+    if tags:
+        return f"{company}呈现出{'、'.join(tags)}的特征。"
+    return f"{company}当前主要面临{'、'.join(cautions)}的问题。"
+
+
+def render_report(data):
+    metrics = normalize_payload(data)
+    metrics['segments'] = data.get('businessSegments') or []
+    company_block = render_company_block(data, metrics['marketLabel'], metrics['codeLabel'])
+    business = business_points(metrics['profile'], metrics.get('segments'), data.get('marketType'))
+    highlights = generate_highlights(metrics)
+    risks = generate_risks(metrics)
+    conclusion = conclusion_text(data.get('company'), metrics)
+
+    return f"""{company_block}
 
 ## 业务
-{bullet_lines(business, '业务描述待补充。')}
+{bullet_lines(business, '业务描述暂缺。')}
 
 ## 财务摘要
-- 收入: {fmt_num(f.get('revenue'), usd=True)}
-- 净利润: {fmt_num(f.get('netIncome'), usd=True)}
-- 净利率: {pct_text(margin)}
-- 总资产: {fmt_num(f.get('assets'), usd=True)}
-- 总负债: {fmt_num(f.get('liabilities'), usd=True)}
-- 负债/资产: {pct_text(leverage)}
-- 现金: {fmt_num(f.get('cash'), usd=True)}
-- 现金/负债: {pct_text(cash_ratio)}
-- 经营现金流: {fmt_num(f.get('operatingCashFlow'), usd=True)}
-- 经营现金流/收入: {pct_text(ocf_margin)}
-- 资本开支: {fmt_num(f.get('capex'), usd=True)}
-- 粗略自由现金流: {fmt_num(fcf, usd=True)}
-- 粗略市盈率: {f'{approx_pe:.1f}x' if approx_pe is not None else 'NA'}
-- 最新价: {market.get('price', 'NA')}
-- 开盘价: {market.get('open', 'NA')}
-- 日内区间: {market.get('low', 'NA')} - {market.get('high', 'NA')}
-- 52周区间位置: {pct_text(price_pos)}
-- 涨跌幅: {market.get('change_pct', 'NA')}
+- 收入: {metrics.get('revenue', 'NA')}
+- 收入增速: {pct_text(metrics.get('revenueGrowth'))}
+- 毛利率: {pct_text(metrics.get('grossMargin'))}
+- 净利润: {metrics.get('netIncome', 'NA')}
+- 净利润增速: {pct_text(metrics.get('netIncomeGrowth'))}
+- 净利率: {pct_text(metrics.get('netMargin'))}
+- 经营现金流: {metrics.get('operatingCashFlow') or 'NA'}
+- 经营现金流率: {pct_text(metrics.get('operatingCashFlowMargin'))}
+- 每股经营现金流: {metrics.get('operatingCashFlowPerShare') or 'NA'}
+- 负债/资产: {pct_text(metrics.get('leverage'))}
+- 现金/总负债: {pct_text(metrics.get('cashToLiabilities'))}
+- 总市值: {fmt_num(metrics.get('marketCap'), metrics.get('currency'))}
+- 市盈率: {f"{metrics['pe']:.1f}x" if metrics.get('pe') is not None else 'NA'}
+- 市净率: {f"{metrics['pb']:.1f}x" if metrics.get('pb') is not None else 'NA'}
+- 市销率: {f"{metrics['ps']:.1f}x" if metrics.get('ps') is not None else 'NA'}
 
 ## 亮点
-{bullet_lines(highlights, '已接入 SEC 财务披露和美股行情，可以直接进入基本面首轮判断。')}
+{bullet_lines(highlights, '当前亮点不集中，整体表现偏均衡。')}
 
 ## 风险
-{bullet_lines(risks, '需结合 10-K/10-Q 原文继续核验。')}
+{bullet_lines(risks, '当前主要风险在于增长、利润率和估值能否持续匹配。')}
 
 ## 一句话结论
 - {conclusion}"""
@@ -413,13 +469,7 @@ def render_us(data):
 
 def main():
     payload = json.loads(sys.stdin.read())
-    market = payload.get('marketType')
-    if market == 'CN':
-        print(render_cn(payload))
-    elif market == 'HK':
-        print(render_hk(payload))
-    else:
-        print(render_us(payload))
+    print(render_report(payload))
 
 
 if __name__ == '__main__':

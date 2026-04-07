@@ -49,6 +49,43 @@ def fetch_json(url, headers=None, timeout=20):
     return json.loads(fetch_text(url, headers=headers, timeout=timeout))
 
 
+def clean_text(text):
+    text = (text or '').replace('\u3000', ' ')
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def to_float(value):
+    if value in (None, '', False):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).replace(',', '').replace('%', '').strip()
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def first_non_empty(*values):
+    for value in values:
+        if value not in (None, '', False):
+            return value
+    return None
+
+
+def dataframe_kv(df, key_col='item', value_col='value'):
+    out = {}
+    if df is None or getattr(df, 'empty', True):
+        return out
+    for _, row in df.iterrows():
+        key = row.get(key_col)
+        if key in (None, ''):
+            continue
+        out[str(key)] = row.get(value_col)
+    return out
+
+
 def contains_chinese(text):
     return bool(re.search(r'[\u4e00-\u9fff]', text or ''))
 

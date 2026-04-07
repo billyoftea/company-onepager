@@ -3,7 +3,9 @@ import re
 import sys
 import urllib.request
 
-from common import fetch_json, fetch_text, resolve_company, resolve_sec_company
+import akshare as ak
+
+from common import clean_text, dataframe_kv, first_non_empty, resolve_company, resolve_sec_company, to_float
 
 HEADERS = {'User-Agent': 'OpenClaw company-onepager research openclaw@example.com'}
 ANNUAL_FORMS = {'10-K', '10-K/A', '20-F', '20-F/A'}
@@ -17,31 +19,20 @@ def fetch_sec_json(url):
 
 
 def fetch_sina_us_quote(ticker: str):
-    symbol = f'gb_{ticker.lower()}'
-    text = fetch_text(
-        f'https://hq.sinajs.cn/list={symbol}',
-        headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://finance.sina.com.cn/'},
-        encoding='gbk',
-    )
+    url = f'https://hq.sinajs.cn/list=gb_{ticker.lower()}'
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://finance.sina.com.cn/'})
+    with urllib.request.urlopen(req, timeout=20) as response:
+        text = response.read().decode('gbk', 'ignore')
     match = re.search(r'="([^"]*)"', text)
     if not match or not match.group(1):
         return {}
     parts = match.group(1).split(',')
-    if len(parts) < 8:
+    if len(parts) < 15:
         return {}
     return {
         'name': parts[0],
-        'price': parts[1],
-        'change_pct': parts[2],
-        'update_time': parts[3],
-        'change': parts[4],
-        'open': parts[5],
-        'high': parts[6],
-        'low': parts[7],
-        'year_high': parts[8] if len(parts) > 8 else None,
-        'year_low': parts[9] if len(parts) > 9 else None,
-        'volume': parts[10] if len(parts) > 10 else None,
-        'market_cap': parts[12] if len(parts) > 12 else None,
+        'marketCap': to_float(parts[12]),
+        'pe': to_float(parts[14]),
     }
 
 
@@ -60,7 +51,7 @@ def duration_days(item):
         return None
 
 
-def select_fact(facts, taxonomy, concepts, unit='USD', annual=False):
+def select_facts(facts, taxonomy, concepts, unit='USD', annual=False):
     if isinstance(concepts, str):
         concepts = [concepts]
     candidates = []
@@ -80,20 +71,50 @@ def select_fact(facts, taxonomy, concepts, unit='USD', annual=False):
                 if form not in INSTANT_FORMS:
                     continue
             candidates.append({**item, 'concept': concept})
-    if not candidates:
-        return None
     candidates.sort(key=lambda x: (str(x.get('end', '')), str(x.get('filed', '')), str(x.get('fy', ''))), reverse=True)
-    return candidates[0]
+    return candidates
 
 
-def annual_value(facts, concepts):
-    item = select_fact(facts, 'us-gaap', concepts, annual=True)
-    return item.get('val') if item else None, item
+def top_unique_facts(facts, taxonomy, concepts, unit='USD', annual=False, limit=2):
+    results = []
+    seen = set()
+    for item in select_facts(facts, taxonomy, concepts, unit=unit, annual=annual):
+        key = (item.get('end'), item.get('concept'))
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(item)
+        if len(results) >= limit:
+            break
+    return results
 
 
-def instant_value(facts, concepts):
-    item = select_fact(facts, 'us-gaap', concepts, annual=False)
-    return item.get('val') if item else None, item
+def latest_and_previous_value(facts, concepts):
+    items = top_unique_facts(facts, 'us-gaap', concepts, annual=True, limit=2)
+    latest = items[0].get('val') if len(items) >= 1 else None
+    previous = items[1].get('val') if len(items) >= 2 else None
+    latest_item = items[0] if items else None
+    return latest, previous, latest_item
+
+
+def latest_instant_value(facts, concepts):
+    items = top_unique_facts(facts, 'us-gaap', concepts, annual=False, limit=1)
+    latest = items[0].get('val') if items else None
+    latest_item = items[0] if items else None
+    return latest, latest_item
+
+
+def growth(latest, previous):
+    if latest in (None, '') or previous in (None, '', 0):
+        return None
+    try:
+        latest = float(latest)
+        previous = float(previous)
+    except Exception:
+        return None
+    if previous == 0:
+        return None
+    return latest / previous - 1
 
 
 def main():
@@ -109,24 +130,19 @@ def main():
     facts = fetch_sec_json(f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json')
     submission = fetch_sec_json(f'https://data.sec.gov/submissions/CIK{cik}.json')
 
-    revenue, revenue_item = annual_value(facts, ['RevenueFromContractWithCustomerExcludingAssessedTax', 'SalesRevenueNet', 'Revenues'])
-    net_income, net_income_item = annual_value(facts, 'NetIncomeLoss')
-    op_cash, op_cash_item = annual_value(facts, 'NetCashProvidedByUsedInOperatingActivities')
-    capex, capex_item = annual_value(
+    warnings = []
+
+    revenue, prev_revenue, revenue_item = latest_and_previous_value(facts, ['RevenueFromContractWithCustomerExcludingAssessedTax', 'SalesRevenueNet', 'Revenues'])
+    net_income, prev_net_income, net_income_item = latest_and_previous_value(facts, 'NetIncomeLoss')
+    gross_profit, _, _ = latest_and_previous_value(facts, 'GrossProfit')
+    op_cash, _, op_cash_item = latest_and_previous_value(facts, 'NetCashProvidedByUsedInOperatingActivities')
+    capex, _, capex_item = latest_and_previous_value(
         facts,
         ['PaymentsToAcquirePropertyPlantAndEquipment', 'PropertyPlantAndEquipmentAdditions', 'CapitalExpendituresIncurredButNotYetPaid'],
     )
-    assets, assets_item = instant_value(facts, 'Assets')
-    liabilities, liabilities_item = instant_value(facts, 'Liabilities')
-    cash, cash_item = instant_value(facts, ['CashAndCashEquivalentsAtCarryingValue', 'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents'])
-
-    try:
-        market = fetch_sina_us_quote(sec_match['ticker'])
-    except Exception as exc:
-        market = {}
-        warnings = [f'美股行情抓取失败: {type(exc).__name__}']
-    else:
-        warnings = []
+    assets, assets_item = latest_instant_value(facts, 'Assets')
+    liabilities, liabilities_item = latest_instant_value(facts, 'Liabilities')
+    cash, cash_item = latest_instant_value(facts, ['CashAndCashEquivalentsAtCarryingValue', 'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents'])
 
     if capex_item and capex_item.get('concept') == 'CapitalExpendituresIncurredButNotYetPaid':
         warnings.append('资本开支使用近似口径，解读时请谨慎')
@@ -134,36 +150,55 @@ def main():
         capex = None
         warnings.append('资本开支口径不够稳定，已留空')
 
+    try:
+        xq_profile = dataframe_kv(ak.stock_individual_basic_info_us_xq(symbol=sec_match['ticker']))
+    except Exception:
+        xq_profile = {}
+        warnings.append('业务介绍来源较少')
+
+    try:
+        quote = fetch_sina_us_quote(sec_match['ticker'])
+    except Exception:
+        quote = {}
+        warnings.append('估值字段存在缺失')
+
     report_period = None
-    for item in (revenue_item, net_income_item, op_cash_item, assets_item):
+    for item in (revenue_item, net_income_item, op_cash_item, assets_item, liabilities_item, cash_item):
         if item and item.get('end'):
             report_period = item['end']
             break
 
     out = {
-        'company': sec_match['title'],
+        'company': first_non_empty(clean_text(xq_profile.get('org_name_cn')), sec_match['title']),
         'ticker': sec_match['ticker'],
         'cik': sec_match['cik'],
         'reportPeriod': report_period,
-        'market': market,
         'profile': {
-            'sicDescription': submission.get('sicDescription'),
-            'website': submission.get('website'),
-            'investorWebsite': submission.get('investorWebsite'),
-            'state': submission.get('stateOfIncorporationDescription'),
-            'fiscalYearEnd': submission.get('fiscalYearEnd'),
+            'industry': clean_text(submission.get('sicDescription')),
+            'mainBusiness': clean_text(xq_profile.get('main_operation_business')),
+            'businessIntro': clean_text(first_non_empty(xq_profile.get('org_cn_introduction'), xq_profile.get('operating_scope'))),
+            'website': clean_text(first_non_empty(xq_profile.get('org_website'), submission.get('website'))),
+            'employees': to_float(xq_profile.get('staff_num')),
         },
         'financials': {
             'revenue': revenue,
+            'revenueGrowth': growth(revenue, prev_revenue),
+            'grossProfit': gross_profit,
             'netIncome': net_income,
+            'netIncomeGrowth': growth(net_income, prev_net_income),
             'assets': assets,
             'liabilities': liabilities,
             'cash': cash,
             'operatingCashFlow': op_cash,
             'capex': capex,
         },
+        'marketStats': {
+            'currency': 'USD',
+            'marketCap': quote.get('marketCap'),
+            'pe': quote.get('pe'),
+        },
         'warnings': warnings,
-        'sourceNotes': ['SEC company_tickers', 'SEC companyfacts', 'SEC submissions', '新浪美股行情'],
+        'sourceNotes': ['SEC company_tickers', 'SEC companyfacts', 'SEC submissions', 'AKShare 雪球公司画像', '新浪美股估值字段'],
     }
     print(json.dumps(out, ensure_ascii=False))
 
